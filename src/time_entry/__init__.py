@@ -21,8 +21,8 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-import argparse
 import asyncio
+import click
 import calendar
 import json
 import os
@@ -1286,8 +1286,8 @@ def cmd_init(config_path: Path) -> None:
     print(f"Created {config_path}\nEdit it to set your projects, percentages, and days off.")
 
 
-def cmd_plan(args: argparse.Namespace, config: Config, records: Records, records_path: Path) -> None:
-    year, month = parse_month(getattr(args, "month", None), date.today())
+def cmd_plan(month_str: str | None, dry_run: bool, config: Config, records: Records, records_path: Path) -> None:
+    year, month = parse_month(month_str, date.today())
     fy = fy_of(year, month)
     if fy != config.fiscal_year:
         print(
@@ -1312,7 +1312,7 @@ def cmd_plan(args: argparse.Namespace, config: Config, records: Records, records
         week_schedule=week_schedule,
     )
 
-    if not args.dry_run:
+    if not dry_run:
         records.months = [m for m in records.months if not (m.year == year and m.month == month)]
         records.months.append(record)
         records.months.sort(key=lambda m: (m.year, m.month))
@@ -1320,12 +1320,12 @@ def cmd_plan(args: argparse.Namespace, config: Config, records: Records, records
 
     display_calendar(year, month, record, config, records)
 
-    if args.dry_run:
+    if dry_run:
         print("(dry-run: not saved)")
 
 
-def cmd_show(args: argparse.Namespace, config: Config, records: Records) -> None:
-    year, month = parse_month(getattr(args, "month", None), date.today())
+def cmd_show(month_str: str | None, config: Config, records: Records) -> None:
+    year, month = parse_month(month_str, date.today())
     record = next((m for m in records.months if m.year == year and m.month == month), None)
     if record is None:
         sys.exit(f"No record for {MONTH_NAMES[month]} {year}. Run 'plan' first.")
@@ -1336,30 +1336,30 @@ def cmd_status(config: Config, records: Records) -> None:
     display_status(config, records)
 
 
-def cmd_login(args: argparse.Namespace, config: Config) -> None:
-    asyncio.run(_do_login(config.workday.home_url, args.auth_state))
+def cmd_login(auth_state: Path, config: Config) -> None:
+    asyncio.run(_do_login(config.workday.home_url, auth_state))
 
 
-def cmd_get(args: argparse.Namespace, config: Config, records: Records) -> None:
-    if not args.auth_state.exists():
+def cmd_get(month_str: str | None, auth_state: Path, config: Config, records: Records) -> None:
+    if not auth_state.exists():
         sys.exit(
-            f"Auth state not found at {args.auth_state}.\n"
+            f"Auth state not found at {auth_state}.\n"
             "Run 'time-entry login' first to save your session."
         )
-    year, month = parse_month(getattr(args, "month", None), date.today())
+    year, month = parse_month(month_str, date.today())
     debug_path = _xdg_state_dir() / f"workday_debug_{year:04d}_{month:02d}.html"
-    entries = asyncio.run(_do_get(config.workday.time_entry_url, args.auth_state, year, month, debug_path))
+    entries = asyncio.run(_do_get(config.workday.time_entry_url, auth_state, year, month, debug_path))
     record = next((m for m in records.months if m.year == year and m.month == month), None)
     display_workday_get(year, month, entries, config, record)
 
 
-def cmd_diff(args: argparse.Namespace, config: Config, records: Records) -> None:
-    if not args.auth_state.exists():
+def cmd_diff(month_str: str | None, auth_state: Path, config: Config, records: Records) -> None:
+    if not auth_state.exists():
         sys.exit(
-            f"Auth state not found at {args.auth_state}.\n"
+            f"Auth state not found at {auth_state}.\n"
             "Run 'time-entry login' first to save your session."
         )
-    year, month = parse_month(getattr(args, "month", None), date.today())
+    year, month = parse_month(month_str, date.today())
     record = next((m for m in records.months if m.year == year and m.month == month), None)
     if record is None:
         sys.exit(
@@ -1368,7 +1368,7 @@ def cmd_diff(args: argparse.Namespace, config: Config, records: Records) -> None
         )
 
     debug_path = _xdg_state_dir() / f"workday_debug_{year:04d}_{month:02d}.html"
-    entries = asyncio.run(_do_get(config.workday.time_entry_url, args.auth_state, year, month, debug_path))
+    entries = asyncio.run(_do_get(config.workday.time_entry_url, auth_state, year, month, debug_path))
 
     plan = _plan_by_date(record, config)
     changes, matched, skipped = _compute_diff(entries, plan)
@@ -1377,13 +1377,13 @@ def cmd_diff(args: argparse.Namespace, config: Config, records: Records) -> None
     display_diff(year, month, changes, matched, skipped, diff_path)
 
 
-def cmd_apply(args: argparse.Namespace, config: Config, records: Records) -> None:
-    if not args.auth_state.exists():
+def cmd_apply(month_str: str | None, auth_state: Path, yes: bool, inspect: bool, config: Config) -> None:
+    if not auth_state.exists():
         sys.exit(
-            f"Auth state not found at {args.auth_state}.\n"
+            f"Auth state not found at {auth_state}.\n"
             "Run 'time-entry login' first to save your session."
         )
-    year, month = parse_month(getattr(args, "month", None), date.today())
+    year, month = parse_month(month_str, date.today())
 
     # Load changes from the diff JSON produced by 'diff'
     diff_path = _xdg_state_dir() / f"time-entry-diff-{year:04d}-{month:02d}.json"
@@ -1409,7 +1409,7 @@ def cmd_apply(args: argparse.Namespace, config: Config, records: Records) -> Non
         print(f"No changes to apply for {MONTH_NAMES[month]} {year}.")
         return
 
-    dry_run = not getattr(args, "yes", False)
+    dry_run = not yes
     if dry_run:
         print(f"Dry-run ({len(changes)} changes).  Pass --yes to apply.\n")
     else:
@@ -1418,12 +1418,12 @@ def cmd_apply(args: argparse.Namespace, config: Config, records: Records) -> Non
     debug_path = _xdg_state_dir() / f"workday_debug_{year:04d}_{month:02d}.html"
     asyncio.run(_do_apply(
         config.workday.time_entry_url,
-        args.auth_state,
+        auth_state,
         year,
         month,
         changes,
         dry_run=dry_run,
-        inspect=getattr(args, "inspect", False),
+        inspect=inspect,
         debug_html_path=debug_path,
     ))
 
@@ -1432,68 +1432,105 @@ def cmd_apply(args: argparse.Namespace, config: Config, records: Records) -> Non
 # Entry point
 # ---------------------------------------------------------------------------
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        prog="time-entry",
-        description="Monthly time allocator for fiscal-year project reporting.",
+@click.group()
+@click.option("--config", "config_path", type=click.Path(path_type=Path),
+              default=lambda: _xdg_config_dir() / "config.toml",
+              help="Config TOML (default: ~/.config/time-entry/config.toml)")
+@click.option("--records", "records_path", type=click.Path(path_type=Path),
+              default=lambda: _xdg_state_dir() / "time-entry.json",
+              help="Records JSON (default: ~/.local/state/time-entry/time-entry.json)")
+@click.option("--dry-run", is_flag=True, help="Compute but do not save")
+@click.option("--auth-state", "auth_state", type=click.Path(path_type=Path),
+              default=lambda: _xdg_state_dir() / "time-entry-auth.json",
+              help="Playwright auth-state JSON (default: ~/.local/state/time-entry/time-entry-auth.json)")
+@click.pass_context
+def main(ctx, config_path, records_path, dry_run, auth_state):
+    """Monthly time allocator for fiscal-year project reporting."""
+    ctx.ensure_object(dict)
+    ctx.obj.update(
+        config_path=config_path,
+        records_path=records_path,
+        dry_run=dry_run,
+        auth_state=auth_state,
     )
-    parser.add_argument("--config", type=Path, default=_xdg_config_dir() / "config.toml")
-    parser.add_argument("--records", type=Path, default=_xdg_state_dir() / "time-entry.json")
-    parser.add_argument("--dry-run", action="store_true", help="Compute but do not save")
-    parser.add_argument(
-        "--auth-state",
-        type=Path,
-        default=_xdg_state_dir() / "time-entry-auth.json",
-        help="Playwright auth-state JSON (default: ~/.local/state/time-entry/time-entry-auth.json)",
-    )
 
-    sub = parser.add_subparsers(dest="command", required=True)
 
-    p_plan = sub.add_parser("plan", help="Compute (and save) allocation for a month")
-    p_plan.add_argument("month", nargs="?", help="YYYY-MM  (default: current month)")
+def _ctx_load(ctx):
+    obj = ctx.obj
+    config = load_config(obj["config_path"])
+    records = load_records(obj["records_path"], config.fiscal_year)
+    return config, records
 
-    p_show = sub.add_parser("show", help="Display calendar for a saved month")
-    p_show.add_argument("month", nargs="?", help="YYYY-MM  (default: current month)")
 
-    sub.add_parser("status", help="Show FY-to-date totals vs targets")
-    sub.add_parser("init", help="Write a template config file")
-    sub.add_parser("login", help="Open browser for manual SSO+DUO login and save auth state")
+@main.command()
+@click.argument("month", required=False, metavar="YYYY-MM")
+@click.pass_context
+def plan(ctx, month):
+    """Compute (and save) allocation for a month."""
+    config, records = _ctx_load(ctx)
+    cmd_plan(month, ctx.obj["dry_run"], config, records, ctx.obj["records_path"])
 
-    p_get = sub.add_parser("get", help="Read current Workday time entries for a month")
-    p_get.add_argument("month", nargs="?", help="YYYY-MM  (default: current month)")
 
-    p_diff = sub.add_parser("diff", help="Compare Workday entries against plan and save a diff JSON")
-    p_diff.add_argument("month", nargs="?", help="YYYY-MM  (default: current month)")
+@main.command()
+@click.argument("month", required=False, metavar="YYYY-MM")
+@click.pass_context
+def show(ctx, month):
+    """Display calendar for a saved month."""
+    config, records = _ctx_load(ctx)
+    cmd_show(month, config, records)
 
-    p_apply = sub.add_parser("apply", help="Apply diff JSON changes to Workday")
-    p_apply.add_argument("month", nargs="?", help="YYYY-MM  (default: current month)")
-    p_apply.add_argument("--yes", action="store_true", help="Actually apply (default: dry-run)")
-    p_apply.add_argument("--inspect", action="store_true",
-                         help="Pause after first cell click and dump dialog HTML for selector debugging")
 
-    args = parser.parse_args()
+@main.command()
+@click.pass_context
+def status(ctx):
+    """Show FY-to-date totals vs targets."""
+    config, records = _ctx_load(ctx)
+    cmd_status(config, records)
 
-    if args.command == "init":
-        cmd_init(args.config)
-        return
 
-    config = load_config(args.config)
-    records = load_records(args.records, config.fiscal_year)
+@main.command("init")
+@click.pass_context
+def init_cmd(ctx):
+    """Write a template config file."""
+    cmd_init(ctx.obj["config_path"])
 
-    if args.command == "plan":
-        cmd_plan(args, config, records, args.records)
-    elif args.command == "show":
-        cmd_show(args, config, records)
-    elif args.command == "status":
-        cmd_status(config, records)
-    elif args.command == "login":
-        cmd_login(args, config)
-    elif args.command == "get":
-        cmd_get(args, config, records)
-    elif args.command == "diff":
-        cmd_diff(args, config, records)
-    elif args.command == "apply":
-        cmd_apply(args, config, records)
+
+@main.command()
+@click.pass_context
+def login(ctx):
+    """Open browser for manual SSO+DUO login and save auth state."""
+    config, _ = _ctx_load(ctx)
+    cmd_login(ctx.obj["auth_state"], config)
+
+
+@main.command()
+@click.argument("month", required=False, metavar="YYYY-MM")
+@click.pass_context
+def get(ctx, month):
+    """Read current Workday time entries for a month."""
+    config, records = _ctx_load(ctx)
+    cmd_get(month, ctx.obj["auth_state"], config, records)
+
+
+@main.command()
+@click.argument("month", required=False, metavar="YYYY-MM")
+@click.pass_context
+def diff(ctx, month):
+    """Compare Workday entries against plan and save a diff JSON."""
+    config, records = _ctx_load(ctx)
+    cmd_diff(month, ctx.obj["auth_state"], config, records)
+
+
+@main.command()
+@click.argument("month", required=False, metavar="YYYY-MM")
+@click.option("--yes", is_flag=True, help="Actually apply (default: dry-run)")
+@click.option("--inspect", is_flag=True,
+              help="Pause after first cell click and dump dialog HTML for selector debugging")
+@click.pass_context
+def apply(ctx, month, yes, inspect):
+    """Apply diff JSON changes to Workday."""
+    config, records = _ctx_load(ctx)
+    cmd_apply(month, ctx.obj["auth_state"], yes, inspect, config)
 
 
 if __name__ == "__main__":
