@@ -9,8 +9,6 @@ that compensates for cumulative drift across the fiscal year (which ends Sep
 30).  It can then read the current state of the Workday calendar, diff it
 against the plan and drive a browser to enter the missing days.
 
-This package was extracted from my [[https://github.com/brettviren/tools][tools]] package and carries its git history.
-
 * Install
 
 As an end-user:
@@ -88,11 +86,14 @@ All four paths can be overridden with top-level options, see =time-entry --help=
 quirks of driving its SPA and a roadmap for replacing the slow per-day entry
 dialog with Workday's bulk weekly flows.
 
-* Cautions
+* Cautions and caveats
 
 Workday's DOM is tenant- and version-specific.  The selectors here were
-confirmed against BNL's tenant and drift over time.  Always run =apply= without
-=--yes= first, and re-run =diff= afterwards to confirm what actually landed.
+confirmed against BNL's tenant and drift over time.  To be most cautious, run =apply= without =--yes= first, and re-run =diff= afterwards to confirm what actually landed.
+
+The current policy fills in the month using 8 hour per day atoms so that it is accurate on average compared to the configured %FTE per project.  The current policy has no facility to make individual hours/days record what effort was actually done those specific hours/days.  That is, the configured %FTE per project is taken as ground truth for the month as a whole.
+
+* License
 
 This package is written for my use, but others are free to use it according to
 its [[file:LICENSE][GPLv3+]] licensing.
