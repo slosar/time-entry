@@ -1,0 +1,383 @@
+"""Tests for the pure (non-browser) parts of time_entry.
+
+The Workday automation itself needs a real browser and a real login, so the
+tests here cover the allocation algorithm, the config/records I/O and the CLI
+wiring, including where configuration and state are looked for.
+"""
+
+import json
+from datetime import date
+
+import pytest
+from click.testing import CliRunner
+
+import time_entry as te
+
+GOOD_TOML = """\
+fiscal_year = 2026
+days_off = ["2026-07-03"]
+
+[workday]
+home_url = "https://example.com/home"
+time_entry_url = "https://example.com/time"
+
+[[projects]]
+code = "AAAAA"
+pct = 50
+desc = "Project A"
+
+[[projects]]
+code = "BBBBB"
+pct = 50
+desc = "Project B"
+"""
+
+
+@pytest.fixture()
+def xdg(tmp_path, monkeypatch):
+    """Point the XDG directories at a temporary area."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    return tmp_path
+
+
+@pytest.fixture()
+def config(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text(GOOD_TOML)
+    return te.load_config(path)
+
+
+# ---------------------------------------------------------------------------
+# XDG locations
+# ---------------------------------------------------------------------------
+
+def test_xdg_dir_honors_environment(xdg):
+    assert te._xdg_dir("config") == xdg / "config" / "time-entry"
+    assert te._xdg_dir("state") == xdg / "state" / "time-entry"
+    assert te._xdg_dir("config").is_dir()
+
+
+def test_xdg_dir_falls_back_to_config_home(tmp_path, monkeypatch):
+    """With no XDG_*_HOME set, both config and state live in ~/.config/time-entry.
+
+    Existing installations keep their records there, so this fallback must not
+    change.
+    """
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    expected = tmp_path / ".config" / "time-entry"
+    assert te._xdg_dir("config") == expected
+    assert te._xdg_dir("state") == expected
+
+
+# ---------------------------------------------------------------------------
+# Fiscal year and calendar helpers
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(("year", "month", "fy"), [
+    (2025, 10, 2026),
+    (2025, 12, 2026),
+    (2026, 1, 2026),
+    (2026, 9, 2026),
+    (2026, 10, 2027),
+])
+def test_fy_of(year, month, fy):
+    assert te.fy_of(year, month) == fy
+
+
+def test_months_in_fy():
+    months = te.months_in_fy(2026)
+    assert len(months) == 12
+    assert months[0] == (2025, 10)
+    assert months[-1] == (2026, 9)
+    assert all(te.fy_of(y, m) == 2026 for y, m in months)
+
+
+def test_get_working_days_excludes_weekends_and_days_off():
+    days = te.get_working_days(2026, 7, set())
+    assert len(days) == 23
+    assert all(d.weekday() < 5 for d in days)
+
+    off = {date(2026, 7, 3), date(2026, 7, 4)}   # Fri, Sat
+    days = te.get_working_days(2026, 7, off)
+    assert len(days) == 22                        # only the Friday counted
+    assert date(2026, 7, 3) not in days
+
+
+def test_get_weeks_in_month():
+    weeks = te.get_weeks_in_month(2026, 7, set())
+    assert [str(monday) for monday, _ in weeks] == [
+        "2026-06-29", "2026-07-06", "2026-07-13", "2026-07-20", "2026-07-27",
+    ]
+    assert [len(days) for _, days in weeks] == [3, 5, 5, 5, 5]
+    # The partial first week only holds days of the target month.
+    assert all(d.month == 7 for d in weeks[0][1])
+
+
+def test_get_weeks_in_month_drops_fully_off_weeks():
+    off = set(te.get_working_days(2026, 7, set())[:3])   # all of Jul 1-3
+    weeks = te.get_weeks_in_month(2026, 7, off)
+    assert str(weeks[0][0]) == "2026-07-06"
+
+
+# ---------------------------------------------------------------------------
+# Allocation
+# ---------------------------------------------------------------------------
+
+def test_compute_allocation_no_history(config):
+    records = te.Records(fiscal_year=2026)
+    alloc = te.compute_allocation(2026, 6, config, records)
+    assert sum(alloc.values()) == 22            # every working day is assigned
+    assert alloc == {"AAAAA": 11, "BBBBB": 11}
+
+
+def test_compute_allocation_compensates_drift(config):
+    """A month that over-serves one project is paid back by the next."""
+    records = te.Records(fiscal_year=2026, months=[
+        te.MonthRecord(year=2026, month=6, working_days=22, days_off=[],
+                       allocation={"AAAAA": 20, "BBBBB": 2}, week_schedule=[]),
+    ])
+    alloc = te.compute_allocation(2026, 7, config, records)
+    working = len(te.get_working_days(2026, 7, config.days_off))
+    assert sum(alloc.values()) == working
+    # B is far behind, so it takes the whole month.
+    assert alloc["BBBBB"] > alloc["AAAAA"]
+    # Cannot un-bill the past, so A is clamped rather than negative.
+    assert alloc["AAAAA"] >= 0
+
+
+def test_compute_allocation_empty_month(config):
+    """A month with no working days allocates nothing."""
+    off = set(te.get_working_days(2026, 7, set()))
+    cfg = te.Config(fiscal_year=2026, projects=config.projects, days_off=off)
+    alloc = te.compute_allocation(2026, 7, cfg, te.Records(fiscal_year=2026))
+    assert sum(alloc.values()) == 0
+
+
+def test_compute_allocation_ignores_other_fiscal_years(config):
+    """Records outside this FY must not perturb the allocation."""
+    records = te.Records(fiscal_year=2026, months=[
+        te.MonthRecord(year=2025, month=6, working_days=20, days_off=[],
+                       allocation={"AAAAA": 20, "BBBBB": 0}, week_schedule=[]),
+    ])
+    assert te.compute_allocation(2026, 6, config, records) == {"AAAAA": 11, "BBBBB": 11}
+
+
+def test_assign_weeks_covers_every_working_day(config):
+    weeks = te.get_weeks_in_month(2026, 7, config.days_off)
+    alloc = te.compute_allocation(2026, 7, config, te.Records(fiscal_year=2026))
+    schedule = te.assign_weeks(alloc, weeks, config.projects)
+
+    assert len(schedule) == len(weeks)
+    for entry, (monday, workdays) in zip(schedule, weeks, strict=True):
+        assert entry.week_start == monday
+        assert sum(count for _, count in entry.days) == len(workdays)
+
+    per_code = {}
+    for entry in schedule:
+        for code, count in entry.days:
+            per_code[code] = per_code.get(code, 0) + count
+    assert per_code == {code: days for code, days in alloc.items() if days}
+
+
+# ---------------------------------------------------------------------------
+# Config and records I/O
+# ---------------------------------------------------------------------------
+
+def test_load_config(config):
+    assert config.fiscal_year == 2026
+    assert [p.code for p in config.projects] == ["AAAAA", "BBBBB"]
+    assert config.projects[0].fraction == 0.5
+    assert config.days_off == {date(2026, 7, 3)}
+    assert config.workday.time_entry_url == "https://example.com/time"
+
+
+def test_load_config_writes_template_when_missing(tmp_path):
+    path = tmp_path / "missing.toml"
+    with pytest.raises(SystemExit) as excinfo:
+        te.load_config(path)
+    assert excinfo.value.code == 0
+    assert path.exists()
+    assert "fiscal_year" in path.read_text()
+
+
+def test_load_config_rejects_bad_percentages(tmp_path):
+    path = tmp_path / "bad.toml"
+    path.write_text(GOOD_TOML.replace("pct = 50", "pct = 40", 1))
+    with pytest.raises(SystemExit) as excinfo:
+        te.load_config(path)
+    assert "90" in str(excinfo.value.code)
+
+
+def test_records_round_trip(tmp_path, config):
+    weeks = te.get_weeks_in_month(2026, 7, config.days_off)
+    alloc = te.compute_allocation(2026, 7, config, te.Records(fiscal_year=2026))
+    record = te.MonthRecord(
+        year=2026, month=7, working_days=22, days_off=[date(2026, 7, 3)],
+        allocation=alloc,
+        week_schedule=te.assign_weeks(alloc, weeks, config.projects),
+    )
+    path = tmp_path / "records.json"
+    te.save_records(path, te.Records(fiscal_year=2026, months=[record]))
+
+    back = te.load_records(path, 2026)
+    assert back.fiscal_year == 2026
+    assert len(back.months) == 1
+    assert back.months[0] == record
+
+
+def test_load_records_missing_file(tmp_path):
+    records = te.load_records(tmp_path / "nope.json", 2026)
+    assert records.fiscal_year == 2026
+    assert records.months == []
+
+
+# ---------------------------------------------------------------------------
+# Plan vs Workday
+# ---------------------------------------------------------------------------
+
+def test_plan_by_date(config):
+    record = te.MonthRecord(
+        year=2026, month=7, working_days=3, days_off=[],
+        allocation={"AAAAA": 2, "BBBBB": 1},
+        week_schedule=[te.WeekEntry(week_start=date(2026, 6, 29),
+                                    days=[("AAAAA", 2), ("BBBBB", 1)])],
+    )
+    plan = te._plan_by_date(record, config)
+    assert plan == {
+        date(2026, 7, 1): ("AAAAA", "Project A"),
+        date(2026, 7, 2): ("AAAAA", "Project A"),
+        date(2026, 7, 3): ("BBBBB", "Project B"),
+    }
+
+
+def test_compute_diff():
+    plan = {
+        date(2026, 7, 1): ("AAAAA", "Project A"),   # already 8h -> matched
+        date(2026, 7, 2): ("AAAAA", "Project A"),   # 0h -> set
+        date(2026, 7, 3): ("BBBBB", "Project B"),   # 4h -> update
+        date(2026, 7, 6): ("BBBBB", "Project B"),   # holiday -> skipped
+    }
+    entries = [
+        te.WorkdayDayEntry(day=date(2026, 7, 1), total_hours=8.0),
+        te.WorkdayDayEntry(day=date(2026, 7, 2), total_hours=0.0),
+        te.WorkdayDayEntry(day=date(2026, 7, 3), total_hours=4.0),
+        te.WorkdayDayEntry(day=date(2026, 7, 6), total_hours=8.0,
+                           is_holiday=True, holiday_name="Independence Day"),
+    ]
+    changes, matched, skipped = te._compute_diff(entries, plan)
+    assert matched == [date(2026, 7, 1)]
+    assert skipped == [date(2026, 7, 6)]
+    assert [(c.day, c.action, c.code) for c in changes] == [
+        (date(2026, 7, 2), "set", "AAAAA"),
+        (date(2026, 7, 3), "update", "BBBBB"),
+    ]
+    assert all(c.target_hours == 8.0 for c in changes)
+
+
+def test_parse_period_label():
+    assert te._parse_period_label("May 2026") == (2026, 5)
+    assert te._parse_period_label("2026-05") == (2026, 5)
+    assert te._parse_period_label("Week of May 11, 2026") == (2026, 5)
+    assert te._parse_period_label("nonsense") is None
+    assert te._parse_period_label("") is None
+
+
+def test_parse_month():
+    today = date(2026, 7, 15)
+    assert te.parse_month(None, today) == (2026, 7)
+    assert te.parse_month("2025-11", today) == (2025, 11)
+    with pytest.raises(SystemExit):
+        te.parse_month("nope", today)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def test_help(xdg):
+    result = CliRunner().invoke(te.main, ["--help"])
+    assert result.exit_code == 0
+    assert "Monthly time allocator" in result.output
+    for command in ("plan", "show", "status", "init", "login", "get", "diff", "apply"):
+        assert command in result.output
+
+
+def test_init_writes_config(tmp_path, xdg):
+    path = tmp_path / "config.toml"
+    runner = CliRunner()
+    result = runner.invoke(te.main, ["--config", str(path), "init"])
+    assert result.exit_code == 0
+    assert path.exists()
+    # The template carries placeholders the user must edit before it parses.
+    assert "FIX" in path.read_text()
+
+    # A second init must not clobber an edited config.
+    path.write_text(GOOD_TOML)
+    result = runner.invoke(te.main, ["--config", str(path), "init"])
+    assert result.exit_code != 0
+    assert path.read_text() == GOOD_TOML
+
+
+def test_plan_show_status(tmp_path, xdg):
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(GOOD_TOML)
+    records_path = tmp_path / "records.json"
+    base = ["--config", str(config_path), "--records", str(records_path)]
+    runner = CliRunner()
+
+    result = runner.invoke(te.main, [*base, "plan", "2026-07"])
+    assert result.exit_code == 0, result.output
+    assert "July 2026" in result.output
+
+    saved = json.loads(records_path.read_text())
+    assert [(m["year"], m["month"]) for m in saved["months"]] == [(2026, 7)]
+    assert sum(saved["months"][0]["allocation"].values()) == 22
+    assert saved["months"][0]["days_off"] == ["2026-07-03"]
+
+    result = runner.invoke(te.main, [*base, "show", "2026-07"])
+    assert result.exit_code == 0
+    assert "Project A" in result.output
+
+    result = runner.invoke(te.main, [*base, "status"])
+    assert result.exit_code == 0
+    assert "FY2026 status" in result.output
+
+
+def test_plan_dry_run_does_not_save(tmp_path, xdg):
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(GOOD_TOML)
+    records_path = tmp_path / "records.json"
+    result = CliRunner().invoke(te.main, [
+        "--config", str(config_path), "--records", str(records_path),
+        "--dry-run", "plan", "2026-07",
+    ])
+    assert result.exit_code == 0
+    assert "dry-run" in result.output
+    assert not records_path.exists()
+
+
+def test_show_without_plan(tmp_path, xdg):
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(GOOD_TOML)
+    result = CliRunner().invoke(te.main, [
+        "--config", str(config_path), "--records", str(tmp_path / "r.json"),
+        "show", "2026-07",
+    ])
+    assert result.exit_code != 0
+    assert "Run 'plan' first" in result.output
+
+
+def test_get_without_auth(tmp_path, xdg):
+    """Browser commands must fail cleanly, not launch anything, without auth."""
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(GOOD_TOML)
+    result = CliRunner().invoke(te.main, [
+        "--config", str(config_path), "--records", str(tmp_path / "r.json"),
+        "--auth-state", str(tmp_path / "auth.json"),
+        "get", "2026-07",
+    ])
+    assert result.exit_code != 0
+    assert "time-entry login" in result.output

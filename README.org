@@ -1,0 +1,98 @@
+#+title: time-entry
+
+Monthly time allocator for fiscal-year project reporting, with (semi-)automated
+entry into the Workday time-entry calendar.
+
+Given a set of projects with target percentages, =time-entry= allocates each
+month's working days to projects using a Hamilton (largest-remainder) method
+that compensates for cumulative drift across the fiscal year (which ends Sep
+30).  It can then read the current state of the Workday calendar, diff it
+against the plan and drive a browser to enter the missing days.
+
+This package was extracted from my [[https://github.com/brettviren/tools][tools]] package and carries its git history.
+
+* Install
+
+As an end-user:
+#+begin_example
+uv tool install git+https://github.com/brettviren/time-entry
+uv tool upgrade time-entry
+#+end_example
+
+As a developer:
+#+begin_example
+git clone git@github.com:brettviren/time-entry.git
+cd time-entry
+uv tool install -e .
+uv run pytest
+#+end_example
+
+The =login=, =get=, =diff= and =apply= commands drive a real browser via
+Playwright.  Its Chromium must be installed once:
+
+#+begin_example
+uvx playwright install chromium
+#+end_example
+
+* Basic use
+
+#+begin_example
+time-entry --help
+time-entry <command> --help
+#+end_example
+
+The typical monthly workflow:
+
+#+begin_example
+time-entry login         # opens a browser for SSO+2FA, saves the session
+time-entry plan          # compute and save this month's allocation
+time-entry get           # read what Workday currently holds
+time-entry diff          # plan vs Workday, saved as a diff JSON
+time-entry apply         # dry-run of the diff
+time-entry apply --yes   # actually enter the days
+#+end_example
+
+Each command takes an optional =YYYY-MM= argument and defaults to the current
+month.  Also useful:
+
+#+begin_example
+time-entry init          # write a template config
+time-entry show          # display a saved month
+time-entry status        # FY-to-date totals vs targets
+#+end_example
+
+* Files
+
+Configuration lives in =$XDG_CONFIG_HOME/time-entry/= (=~/.config/time-entry/=
+by default):
+
+- =config.toml= :: fiscal year, =days_off=, Workday URLs and the =[[projects]]=
+  entries (code, pct, desc).  Percentages must sum to 100.  Run =time-entry
+  init= to write a template.
+
+State lives in =$XDG_STATE_HOME/time-entry/=.  Note that when =XDG_STATE_HOME=
+is unset, state falls back to =~/.config/time-entry/= (not =~/.local/state/=),
+which is where existing state may be found:
+
+- =time-entry.json= :: saved monthly plans/records.
+- =time-entry-auth.json= :: the Playwright =storage_state= saved by =login=.
+- =time-entry-diff-YYYY-MM.json= :: the todo list written by =diff= and consumed
+  by =apply=.
+- =workday_*.html= :: page captures for debugging selectors, safe to delete.
+
+All four paths can be overridden with top-level options, see =time-entry --help=.
+
+* Development notes
+
+[[file:docs/time-entry.md]] records the confirmed Workday DOM selectors, the
+quirks of driving its SPA and a roadmap for replacing the slow per-day entry
+dialog with Workday's bulk weekly flows.
+
+* Cautions
+
+Workday's DOM is tenant- and version-specific.  The selectors here were
+confirmed against BNL's tenant and drift over time.  Always run =apply= without
+=--yes= first, and re-run =diff= afterwards to confirm what actually landed.
+
+This package is written for my use, but others are free to use it according to
+its [[file:LICENSE][GPLv3+]] licensing.

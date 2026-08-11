@@ -1,0 +1,32 @@
+[project]
+name = "time-entry"
+version = "0.1.0"
+description = "Monthly time allocator for fiscal-year project reporting"
+readme = {file = "README.org", content-type = "text/org"}
+license = {file = "LICENSE"}
+authors = [
+    { name = "Brett Viren", email = "brett.viren@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "click>=8.1",
+    "playwright",
+]
+
+[project.scripts]
+time-entry = "time_entry:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["test"]
